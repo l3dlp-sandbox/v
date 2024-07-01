@@ -39,8 +39,7 @@ pub mut:
 	mod2alias          map[string]string // for `import time as t`, will contain: 'time'=>'t'
 	mod2syms           map[string]string // import time { now } 'time.now'=>'now'
 	use_short_fn_args  bool
-	single_line_fields bool   // should struct fields be on a single line
-	it_name            string // the name to replace `it` with
+	single_line_fields bool // should struct fields be on a single line
 	in_lambda_depth    int
 	inside_const       bool
 	inside_unsafe      bool
@@ -879,6 +878,9 @@ pub fn (mut f Fmt) assign_stmt(node ast.AssignStmt) {
 		if i < node.right.len - 1 {
 			f.write(', ')
 		}
+	}
+	if node.attr.name != '' {
+		f.write(' @[${node.attr.name}]')
 	}
 	f.comments(node.end_comments, has_nl: false, same_line: true, level: .keep)
 	if !f.single_line_if {
@@ -2184,6 +2186,11 @@ pub fn (mut f Fmt) comptime_call(node ast.ComptimeCall) {
 					f.write("\$${node.method_name}('${node.args_var}')")
 				}
 			}
+			node.method_name == 'd' {
+				f.write("\$d('${node.args_var}', ")
+				f.expr(node.args[0].expr)
+				f.write(')')
+			}
 			node.method_name == 'res' {
 				if node.args_var != '' {
 					f.write('\$res(${node.args_var})')
@@ -2258,9 +2265,7 @@ pub fn (mut f Fmt) ident(node ast.Ident) {
 		}
 	}
 	f.write_language_prefix(node.language)
-	if node.name == 'it' && f.it_name != '' && f.in_lambda_depth == 0 { // allow `it` in lambdas
-		f.write(f.it_name)
-	} else if node.kind == .blank_ident {
+	if node.kind == .blank_ident {
 		f.write('_')
 	} else {
 		mut is_local := false
@@ -2773,9 +2778,6 @@ fn (mut f Fmt) match_branch(branch ast.MatchBranch, single_line bool) {
 pub fn (mut f Fmt) match_expr(node ast.MatchExpr) {
 	f.write('match ')
 	f.expr(node.cond)
-	if node.cond is ast.Ident {
-		f.it_name = node.cond.name
-	}
 	f.writeln(' {')
 	f.indent++
 	f.comments(node.comments)
@@ -2806,7 +2808,6 @@ pub fn (mut f Fmt) match_expr(node ast.MatchExpr) {
 	}
 	f.indent--
 	f.write('}')
-	f.it_name = ''
 }
 
 pub fn (mut f Fmt) offset_of(node ast.OffsetOf) {

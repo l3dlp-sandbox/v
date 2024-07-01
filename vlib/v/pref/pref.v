@@ -104,7 +104,8 @@ pub mut:
 	is_crun            bool // similar to run, but does not recompile the executable, if there were no changes to the sources
 	is_debug           bool // turned on by -g or -cg, it tells v to pass -g to the C backend compiler.
 	is_vlines          bool // turned on by -g (it slows down .tmp.c generation slightly).
-	is_stats           bool // `v -stats file_test.v` will produce more detailed statistics for the tests that were run
+	is_stats           bool // `v -stats file.v` will produce more detailed statistics for the file that is compiled
+	show_asserts       bool // `VTEST_SHOW_ASSERTS=1 v file_test.v` will show details about the asserts done by a test file. Also activated for `-stats` and `-show-asserts`.
 	show_timings       bool // show how much time each compiler stage took
 	is_fmt             bool
 	is_vet             bool
@@ -116,9 +117,11 @@ pub mut:
 	is_cstrict         bool     // turn on more C warnings; slightly slower
 	is_callstack       bool     // turn on callstack registers on each call when v.debug is imported
 	is_trace           bool     // turn on possibility to trace fn call where v.debug is imported
+	is_coverage        bool     // turn on code coverage stats
 	eval_argument      string   // `println(2+2)` on `v -e "println(2+2)"`. Note that this source code, will be evaluated in vsh mode, so 'v -e 'println(ls(".")!)' is valid.
 	test_runner        string   // can be 'simple' (fastest, but much less detailed), 'tap', 'normal'
 	profile_file       string   // the profile results will be stored inside profile_file
+	coverage_dir       string   // the coverage files will be stored inside coverage_dir
 	profile_no_inline  bool     // when true, [inline] functions would not be profiled
 	profile_fns        []string // when set, profiling will be off by default, but inside these functions (and what they call) it will be on.
 	translated         bool     // `v translate doom.v` are we running V code translated from C? allow globals, ++ expressions, etc
@@ -190,6 +193,7 @@ pub mut:
 	// -d vfmt and -d another=0 for `$if vfmt { will execute }` and `$if another ? { will NOT get here }`
 	compile_defines     []string // just ['vfmt']
 	compile_defines_all []string // contains both: ['vfmt','another']
+	compile_values      map[string]string // the map will contain for `-d key=value`: compile_values['key'] = 'value', and for `-d ident`, it will be: compile_values['ident'] = 'true'
 	//
 	run_args     []string // `v run x.v 1 2 3` => `1 2 3`
 	printfn_list []string // a list of generated function names, whose source should be shown, for debugging
@@ -229,10 +233,13 @@ pub mut:
 	checker_match_exhaustive_cutoff_limit int = 12
 	thread_stack_size                     int = 8388608 // Change with `-thread-stack-size 4194304`. Note: on macos it was 524288, which is too small for more complex programs with many nested callexprs.
 	// wasm settings:
-	wasm_stack_top int = 1024 + (16 * 1024) // stack size for webassembly backend
-	wasm_validate  bool // validate webassembly code, by calling `wasm-validate`
+	wasm_stack_top    int = 1024 + (16 * 1024) // stack size for webassembly backend
+	wasm_validate     bool // validate webassembly code, by calling `wasm-validate`
+	warn_about_allocs bool // -warn-about-allocs warngs about every single allocation, e.g. 'hi $name'. Mostly for low level development where manual memory management is used.
 	// temp
 	// use_64_int bool
+	// forwards compatibility settings:
+	relaxed_gcc14 bool = true // turn on the generated pragmas, that make gcc versions > 14 a lot less pedantic. The default is to have those pragmas in the generated C output, so that gcc-14 can be used on Arch etc.
 }
 
 pub struct LineInfo {
@@ -308,6 +315,10 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 	if os.getenv('VNORUN') != '' {
 		res.skip_running = true
 	}
+	coverage_dir_from_env := os.getenv('VCOVDIR')
+	if coverage_dir_from_env != '' {
+		res.coverage_dir = coverage_dir_from_env
+	}
 	/* $if macos || linux {
 		res.use_cache = true
 		res.skip_unused = true
@@ -361,6 +372,9 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 			}
 			'-show-timings' {
 				res.show_timings = true
+			}
+			'-show-asserts' {
+				res.show_asserts = true
 			}
 			'-check-syntax' {
 				res.only_check_syntax = true
@@ -494,6 +508,9 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 			'-sourcemap' {
 				res.sourcemap = true
 			}
+			'-warn-about-allocs' {
+				res.warn_about_allocs = true
+			}
 			'-sourcemap-src-included' {
 				res.sourcemap_src_included = true
 			}
@@ -595,10 +612,17 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 				res.no_preludes = true
 				res.build_options << arg
 			}
+			'-no-relaxed-gcc14' {
+				res.relaxed_gcc14 = false
+			}
 			'-prof', '-profile' {
 				res.profile_file = cmdline.option(args[i..], arg, '-')
 				res.is_prof = true
 				res.build_options << '${arg} ${res.profile_file}'
+				i++
+			}
+			'-cov', '-coverage' {
+				res.coverage_dir = cmdline.option(args[i..], arg, '-')
 				i++
 			}
 			'-profile-fns' {
@@ -944,12 +968,11 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 					// arguments for e.g. fmt should be checked elsewhere
 					continue
 				}
-				if res.is_vsh && command_idx < i {
-					// Allow for `script.vsh abc 123 -option`, because -option is for the .vsh program, not for v
-					continue
-				}
-				if command == 'doc' {
-					// Allow for `v doc -comments file.v`
+				if command_idx < i && (res.is_vsh || (is_source_file(command)
+					&& command in known_external_commands)) {
+					// When running programs, let them be responsible for the arguments passed to them.
+					// E.g.: `script.vsh cmd -opt` or `v run hello_world.v -opt`.
+					// But detect unknown arguments when building them. E.g.: `v hello_world.v -opt`.
 					continue
 				}
 				err_detail := if command == '' { '' } else { ' for command `${command}`' }
@@ -974,6 +997,7 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 	if command == 'run' {
 		res.is_run = true
 	}
+	res.show_asserts = res.show_asserts || res.is_stats || os.getenv('VTEST_SHOW_ASSERTS') != ''
 	if command == 'run' && res.is_prod && os.is_atty(1) > 0 {
 		eprintln_cond(show_output && !res.is_quiet, "Note: building an optimized binary takes much longer. It shouldn't be used with `v run`.")
 		eprintln_cond(show_output && !res.is_quiet, 'Use `v run` without optimization, or build an optimized binary with -prod first, then run it separately.')
@@ -1065,6 +1089,10 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 	if 'trace' in res.compile_defines_all {
 		res.is_trace = true
 	}
+	if res.coverage_dir != '' {
+		res.is_coverage = true
+		res.build_options << '-coverage ${res.coverage_dir}'
+	}
 	// keep only the unique res.build_options:
 	mut m := map[string]string{}
 	for x in res.build_options {
@@ -1143,39 +1171,37 @@ pub fn cc_from_string(s string) CompilerType {
 	}
 }
 
+fn (mut prefs Preferences) parse_compile_value(define string) {
+	if !define.contains('=') {
+		eprintln_exit('V error: Define argument value missing for ${define}.')
+		return
+	}
+	name := define.all_before('=')
+	value := define.all_after_first('=')
+	prefs.compile_values[name] = value
+}
+
 fn (mut prefs Preferences) parse_define(define string) {
-	define_parts := define.split('=')
-	prefs.diagnose_deprecated_defines(define_parts)
 	if !(prefs.is_debug && define == 'debug') {
 		prefs.build_options << '-d ${define}'
 	}
-	if define_parts.len == 1 {
+	if !define.contains('=') {
+		prefs.compile_values[define] = 'true'
 		prefs.compile_defines << define
 		prefs.compile_defines_all << define
 		return
 	}
-	if define_parts.len == 2 {
-		prefs.compile_defines_all << define_parts[0]
-		match define_parts[1] {
-			'0' {}
-			'1' {
-				prefs.compile_defines << define_parts[0]
-			}
-			else {
-				eprintln_exit(
-					'V error: Unknown define argument value `${define_parts[1]}` for ${define_parts[0]}.' +
-					' Expected `0` or `1`.')
-			}
+	dname := define.all_before('=')
+	dvalue := define.all_after_first('=')
+	prefs.compile_values[dname] = dvalue
+	prefs.compile_defines_all << dname
+	match dvalue {
+		'0' {}
+		'1' {
+			prefs.compile_defines << dname
 		}
-		return
+		else {}
 	}
-	eprintln_exit('V error: Unknown define argument: ${define}. Expected at most one `=`.')
-}
-
-fn (mut prefs Preferences) diagnose_deprecated_defines(define_parts []string) {
-	// if define_parts[0] == 'no_bounds_checking' {
-	// 	eprintln('`-d no_bounds_checking` was deprecated in 2022/10/30. Use `-no-bounds-checking` instead.')
-	// }
 }
 
 pub fn supported_test_runners_list() string {

@@ -4,6 +4,7 @@
 module c
 
 import os
+import term
 import strings
 import hash.fnv1a
 import v.ast
@@ -69,6 +70,7 @@ mut:
 	auto_str_funcs            strings.Builder // function bodies of all auto generated _str funcs
 	dump_funcs                strings.Builder // function bodies of all auto generated _str funcs
 	pcs_declarations          strings.Builder // -prof profile counter declarations for each function
+	cov_declarations          strings.Builder // -cov coverage
 	embedded_data             strings.Builder // data to embed in the executable/binary
 	shared_types              strings.Builder // shared/lock types
 	shared_functions          strings.Builder // shared constructors
@@ -119,6 +121,7 @@ mut:
 	labeled_loops             map[string]&ast.Stmt
 	inner_loop                &ast.Stmt = unsafe { nil }
 	shareds                   map[int]string // types with hidden mutex for which decl has been emitted
+	coverage_files            map[u64]&CoverageInfo
 	inside_ternary            int  // ?: comma separated statements on a single line
 	inside_map_postfix        bool // inside map++/-- postfix expr
 	inside_map_infix          bool // inside map<</+=/-= infix expr
@@ -215,10 +218,11 @@ mut:
 	// where an aggregate (at least two types) is generated
 	// sum type deref needs to know which index to deref because unions take care of the correct field
 	aggregate_type_idx  int
-	arg_no_auto_deref   bool   // smartcast must not be dereferenced
-	branch_parent_pos   int    // used in BranchStmt (continue/break) for autofree stop position
-	returned_var_name   string // to detect that a var doesn't need to be freed since it's being returned
-	infix_left_var_name string // a && if expr
+	arg_no_auto_deref   bool     // smartcast must not be dereferenced
+	branch_parent_pos   int      // used in BranchStmt (continue/break) for autofree stop position
+	returned_var_name   string   // to detect that a var doesn't need to be freed since it's being returned
+	infix_left_var_name string   // a && if expr
+	curr_var_name       []string // curr var name on assignment
 	called_fn_name      string
 	timers              &util.Timers = util.get_timers()
 	force_main_console  bool // true when [console] used on fn main()
@@ -299,6 +303,7 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) (str
 		auto_str_funcs: strings.new_builder(100)
 		dump_funcs: strings.new_builder(100)
 		pcs_declarations: strings.new_builder(100)
+		cov_declarations: strings.new_builder(100)
 		embedded_data: strings.new_builder(1000)
 		out_options_forward: strings.new_builder(100)
 		out_options: strings.new_builder(100)
@@ -379,6 +384,7 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) (str
 			global_g.dump_funcs.write(g.auto_str_funcs) or { panic(err) }
 			global_g.comptime_definitions.write(g.comptime_definitions) or { panic(err) }
 			global_g.pcs_declarations.write(g.pcs_declarations) or { panic(err) }
+			global_g.cov_declarations.write(g.cov_declarations) or { panic(err) }
 			global_g.hotcode_definitions.write(g.hotcode_definitions) or { panic(err) }
 			global_g.embedded_data.write(g.embedded_data) or { panic(err) }
 			global_g.shared_types.write(g.shared_types) or { panic(err) }
@@ -410,6 +416,9 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) (str
 			}
 			for k, v in g.sumtype_definitions {
 				global_g.sumtype_definitions[k] = v
+			}
+			for k, v in g.coverage_files {
+				global_g.coverage_files[k] = v
 			}
 			global_g.json_forward_decls.write(g.json_forward_decls) or { panic(err) }
 			global_g.enum_typedefs.write(g.enum_typedefs) or { panic(err) }
@@ -503,6 +512,15 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) (str
 	if g.pref.build_mode != .build_module {
 		// no init in builtin.o
 		g.write_init_function()
+	}
+
+	if g.pref.is_coverage {
+		mut total_code_points := 0
+		for k, cov in g.coverage_files {
+			g.cheaders.writeln('#define _v_cov_file_offset_${k} ${total_code_points}')
+			total_code_points += cov.points.len
+		}
+		g.cheaders.writeln('long int _v_cov[${total_code_points}] = {0};')
 	}
 
 	// insert for options forward
@@ -616,6 +634,10 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) (str
 			b.writeln(fn_def)
 		}
 	}
+	if g.pref.is_coverage {
+		b.writeln('\n// V coverage:')
+		b.write_string(g.cov_declarations.str())
+	}
 	b.writeln('\n// end of V out')
 	mut header := b.last_n(b.len)
 	header = '#ifndef V_HEADER_FILE\n#define V_HEADER_FILE' + header
@@ -654,6 +676,7 @@ fn cgen_process_one_file_cb(mut p pool.PoolProcessor, idx int, wid int) &Gen {
 		auto_str_funcs: strings.new_builder(100)
 		comptime_definitions: strings.new_builder(100)
 		pcs_declarations: strings.new_builder(100)
+		cov_declarations: strings.new_builder(100)
 		hotcode_definitions: strings.new_builder(100)
 		embedded_data: strings.new_builder(1000)
 		out_options_forward: strings.new_builder(100)
@@ -724,6 +747,7 @@ pub fn (mut g Gen) free_builders() {
 		g.dump_funcs.free()
 		g.comptime_definitions.free()
 		g.pcs_declarations.free()
+		g.cov_declarations.free()
 		g.hotcode_definitions.free()
 		g.embedded_data.free()
 		g.shared_types.free()
@@ -770,6 +794,17 @@ pub fn (mut g Gen) init() {
 		g.cheaders.writeln(g.pref.custom_prelude)
 	} else if !g.pref.no_preludes {
 		g.cheaders.writeln('// Generated by the V compiler')
+		if g.pref.relaxed_gcc14 {
+			// See https://gcc.gnu.org/gcc-14/porting_to.html#c-code-generators:
+			g.cheaders.writeln('
+#if defined __GNUC__ && __GNUC__ >= 14
+#pragma GCC diagnostic warning "-Wimplicit-function-declaration"
+#pragma GCC diagnostic warning "-Wincompatible-pointer-types"
+#pragma GCC diagnostic warning "-Wint-conversion"
+#pragma GCC diagnostic warning "-Wreturn-mismatch"
+#endif
+')
+		}
 		if g.pref.os == .wasm32 {
 			g.cheaders.writeln('#define VWASM 1')
 			// Include <stdint.h> instead of <inttypes.h> for WASM target
@@ -2011,8 +2046,10 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 				}
 			} else {
 				simple_assign =
-					(expr is ast.SelectorExpr || (expr is ast.Ident && !expr.is_auto_heap()))
-					&& ret_typ.is_ptr() && expr_typ.is_ptr() && expr_typ.has_flag(.option)
+					((expr is ast.SelectorExpr || (expr is ast.Ident && !expr.is_auto_heap()))
+					&& ret_typ.is_ptr() && expr_typ.is_ptr() && expr_typ.has_flag(.option))
+					|| (expr_typ == ret_typ && !(expr_typ.has_option_or_result()
+					&& (expr_typ.is_ptr() || expr is ast.LambdaExpr)))
 				// option ptr assignment simplification
 				if simple_assign {
 					g.write('${tmp_var} = ')
@@ -2049,7 +2086,7 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 }
 
 @[inline]
-fn (mut g Gen) write_v_source_line_info(pos token.Pos) {
+fn (mut g Gen) write_v_source_line_info_pos(pos token.Pos) {
 	if g.inside_ternary == 0 && g.pref.is_vlines && g.is_vlines_enabled {
 		nline := pos.line_nr + 1
 		lineinfo := '\n#line ${nline} "${g.vlines_path}"'
@@ -2057,6 +2094,30 @@ fn (mut g Gen) write_v_source_line_info(pos token.Pos) {
 			eprintln('> lineinfo: ${lineinfo.replace('\n', '')}')
 		}
 		g.writeln(lineinfo)
+	}
+}
+
+@[inline]
+fn (mut g Gen) write_v_source_line_info(node ast.Node) {
+	g.write_v_source_line_info_pos(node.pos())
+	if g.inside_ternary == 0 && g.pref.is_coverage
+		&& node !in [ast.MatchBranch, ast.IfBranch, ast.InfixExpr] {
+		g.write_coverage_point(node.pos())
+	}
+}
+
+@[inline]
+fn (mut g Gen) write_v_source_line_info_stmt(stmt ast.Stmt) {
+	g.write_v_source_line_info_pos(stmt.pos)
+	if g.inside_ternary == 0 && g.pref.is_coverage && !g.inside_for_c_stmt
+		&& stmt !in [ast.FnDecl, ast.ForCStmt, ast.ForInStmt, ast.ForStmt] {
+		if stmt is ast.AssertStmt {
+			if stmt.expr !in [ast.InfixExpr, ast.MatchExpr] {
+				g.write_coverage_point(stmt.pos)
+			}
+		} else {
+			g.write_coverage_point(stmt.pos)
+		}
 	}
 }
 
@@ -2075,19 +2136,19 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 	}
 	match node {
 		ast.AsmStmt {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.asm_stmt(node)
 		}
 		ast.AssertStmt {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.assert_stmt(node)
 		}
 		ast.AssignStmt {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.assign_stmt(node)
 		}
 		ast.Block {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			if node.is_unsafe {
 				g.writeln('{ // Unsafe block')
 			} else {
@@ -2097,11 +2158,11 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 			g.writeln('}')
 		}
 		ast.BranchStmt {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.branch_stmt(node)
 		}
 		ast.ConstDecl {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.const_decl(node)
 		}
 		ast.ComptimeFor {
@@ -2121,13 +2182,16 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 			g.enum_decl(node)
 		}
 		ast.ExprStmt {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			// af := g.autofree && node.expr is ast.CallExpr && !g.is_builtin_mod
 			// if af {
 			// g.autofree_call_pregen(node.expr as ast.CallExpr)
 			// }
 			old_is_void_expr_stmt := g.is_void_expr_stmt
 			g.is_void_expr_stmt = !node.is_expr
+			if node.expr.is_auto_deref_var() {
+				g.write('*')
+			}
 			if node.typ != ast.void_type && g.expected_cast_type != 0
 				&& node.expr !in [ast.IfExpr, ast.MatchExpr] {
 				g.expr_with_cast(node.expr, node.typ, g.expected_cast_type)
@@ -2161,7 +2225,7 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 					g.labeled_loops[node.label] = &node
 				}
 			}
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.for_c_stmt(node)
 			g.branch_parent_pos = prev_branch_parent_pos
 			g.labeled_loops.delete(node.label)
@@ -2177,7 +2241,7 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 					g.labeled_loops[node.label] = &node
 				}
 			}
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.for_in_stmt(node)
 			g.branch_parent_pos = prev_branch_parent_pos
 			g.labeled_loops.delete(node.label)
@@ -2193,7 +2257,7 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 					g.labeled_loops[node.label] = &node
 				}
 			}
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.for_stmt(node)
 			g.branch_parent_pos = prev_branch_parent_pos
 			g.labeled_loops.delete(node.label)
@@ -2206,7 +2270,7 @@ fn (mut g Gen) stmt(node ast.Stmt) {
 			g.writeln('${c_name(node.name)}: {}')
 		}
 		ast.GotoStmt {
-			g.write_v_source_line_info(node.pos)
+			g.write_v_source_line_info_stmt(node)
 			g.writeln('goto ${c_name(node.name)};')
 		}
 		ast.HashStmt {
@@ -2330,7 +2394,7 @@ fn (mut g Gen) get_sumtype_casting_fn(got_ ast.Type, exp_ ast.Type) string {
 		g.get_sumtype_variant_name(exp_, exp_sym)
 	}
 	// fn_name := '${got_sym.cname}_to_sumtype_${exp_sym.cname}'
-	fn_name := '${g.get_sumtype_variant_name(got_, got_sym)}_to_sumtype_${cname}/*KEK*/'
+	fn_name := '${g.get_sumtype_variant_name(got_, got_sym)}_to_sumtype_${cname}'
 	if got == exp || g.sumtype_definitions[i] {
 		return fn_name
 	}
@@ -2455,6 +2519,20 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp_is_ptr
 	g.write(')'.repeat(rparen_n))
 }
 
+// use instead of expr() when you need a var to use as reference
+fn (mut g Gen) expr_with_var(expr ast.Expr, got_type_raw ast.Type, expected_type ast.Type) string {
+	stmt_str := g.go_before_last_stmt().trim_space()
+	g.empty_line = true
+	tmp_var := g.new_tmp_var()
+	styp := g.typ(expected_type)
+	g.writeln('${styp} ${tmp_var};')
+	g.write('memcpy(&${tmp_var}, ')
+	g.expr(expr)
+	g.writeln(', sizeof(${styp}));')
+	g.write(stmt_str)
+	return tmp_var
+}
+
 // use instead of expr() when you need to cast to a different type
 fn (mut g Gen) expr_with_cast(expr ast.Expr, got_type_raw ast.Type, expected_type ast.Type) {
 	got_type := ast.mktyp(got_type_raw)
@@ -2503,6 +2581,15 @@ fn (mut g Gen) expr_with_cast(expr ast.Expr, got_type_raw ast.Type, expected_typ
 			}
 			if exp_sym.info.is_generic {
 				fname = g.generic_fn_name(exp_sym.info.concrete_types, fname)
+			}
+			if g.pref.experimental {
+				// Do not allocate for `Interface(unsafe{nil})` casts
+				is_nil_cast := expr is ast.UnsafeExpr && expr.expr is ast.Nil
+				if is_nil_cast {
+					g.write('/*nili*/')
+					g.write('((void*)0)')
+					return
+				}
 			}
 			g.call_cfn_for_casting_expr(fname, expr, expected_is_ptr, exp_styp, got_is_ptr,
 				false, got_styp)
@@ -4080,6 +4167,9 @@ fn (mut g Gen) debugger_stmt(node ast.DebuggerStmt) {
 	mut count := 1
 	outer: for _, obj in scope_vars {
 		if obj.name !in vars {
+			if obj.name in g.curr_var_name {
+				continue
+			}
 			if obj is ast.Var && g.check_var_scope(obj, node.pos.pos) {
 				keys.write_string('_SLIT("${obj.name}")')
 				var_typ := if obj.ct_type_var != .no_comptime {
@@ -4205,7 +4295,7 @@ fn (mut g Gen) debugger_stmt(node ast.DebuggerStmt) {
 fn (mut g Gen) enum_decl(node ast.EnumDecl) {
 	enum_name := util.no_dots(node.name)
 	is_flag := node.is_flag
-	if g.pref.ccompiler == 'msvc' {
+	if g.is_cc_msvc {
 		mut last_value := '0'
 		enum_typ_name := g.table.get_type_name(node.typ)
 		g.enum_typedefs.writeln('')
@@ -4640,12 +4730,6 @@ fn (mut g Gen) select_expr(node ast.SelectExpr) {
 	}
 }
 
-@[inline]
-pub fn (mut g Gen) is_generic_param_var(node ast.Expr) bool {
-	return node is ast.Ident && node.info is ast.IdentVar && node.obj is ast.Var
-		&& (node.obj as ast.Var).ct_type_var == .generic_param
-}
-
 fn (mut g Gen) get_const_name(node ast.Ident) string {
 	if g.pref.translated && !g.is_builtin_mod
 		&& !util.module_is_builtin(node.name.all_before_last('.')) {
@@ -4853,7 +4937,14 @@ fn (mut g Gen) ident(node ast.Ident) {
 								if node.obj.is_inherited {
 									g.write(closure_ctx + '->')
 								}
-								g.write(name)
+								if node.obj.typ.nr_muls() > 1 {
+									g.write('(')
+									g.write('*'.repeat(node.obj.typ.nr_muls() - 1))
+									g.write(name)
+									g.write(')')
+								} else {
+									g.write(name)
+								}
 								if node.obj.orig_type.is_ptr() {
 									is_ptr = true
 								}
@@ -5266,7 +5357,7 @@ fn (mut g Gen) branch_stmt(node ast.BranchStmt) {
 
 fn (mut g Gen) return_stmt(node ast.Return) {
 	g.set_current_pos_as_last_stmt_pos()
-	g.write_v_source_line_info(node.pos)
+	g.write_v_source_line_info_stmt(node)
 
 	g.inside_return = true
 	defer {
@@ -6187,6 +6278,8 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 			default_initializer := g.type_default(field.typ)
 			if default_initializer == '{0}' && should_init {
 				def_builder.write_string(' = {0}')
+			} else if default_initializer == '{EMPTY_STRUCT_INITIALIZATION}' && should_init {
+				init = '\tmemcpy(${field.name}, (${styp}){${g.type_default(field.typ)}}, sizeof(${styp})); // global'
 			} else {
 				if field.name !in ['as_cast_type_indexes', 'g_memory_block', 'global_allocator'] {
 					init = '\t${field.name} = *(${styp}*)&((${styp}[]){${g.type_default(field.typ)}}[0]); // global'
@@ -6409,6 +6502,10 @@ fn (mut g Gen) write_init_function() {
 	}
 	if g.pref.use_coroutines {
 		g.writeln('\tdelete_photon_work_pool();')
+	}
+	if g.pref.is_coverage {
+		g.write_coverage_stats()
+		g.writeln('\tvprint_coverage_stats();')
 	}
 	g.writeln('}')
 	if g.pref.printfn_list.len > 0 && '_vcleanup' in g.pref.printfn_list {
@@ -6883,7 +6980,7 @@ fn (mut g Gen) gen_or_block_stmts(cvar_name string, cast_typ string, stmts []ast
 							&& g.table.final_sym(return_type).kind == .array_fixed
 						if !is_array_fixed {
 							if g.inside_return && !g.inside_struct_init
-								&& expr_stmt.expr is ast.CallExpr
+								&& expr_stmt.expr is ast.CallExpr&& (expr_stmt.expr as ast.CallExpr).return_type.has_option_or_result()
 								&& g.cur_fn.return_type.has_option_or_result()
 								&& return_type.has_option_or_result()
 								&& expr_stmt.expr.or_block.kind == .absent {
@@ -7066,7 +7163,13 @@ fn (mut g Gen) type_default(typ_ ast.Type) string {
 		.string {
 			return '(string){.str=(byteptr)"", .is_lit=1}'
 		}
-		.interface_, .sum_type, .array_fixed, .multi_return, .thread {
+		.array_fixed {
+			if sym.is_empty_struct_array() {
+				return '{EMPTY_STRUCT_INITIALIZATION}'
+			}
+			return '{0}'
+		}
+		.interface_, .sum_type, .multi_return, .thread {
 			return '{0}'
 		}
 		.alias {
@@ -7789,6 +7892,38 @@ fn (mut g Gen) trace[T](fbase string, x &T) {
 	if g.file.path_base == fbase {
 		println('> g.trace | ${fbase:-10s} | ${voidptr(x):16} | ${x}')
 	}
+}
+
+@[params]
+pub struct TraceLastLinesParams {
+pub:
+	nlines int = 2
+	msg    string
+}
+
+fn (mut g Gen) trace_last_lines(fbase string, params TraceLastLinesParams) {
+	if fbase != '' && g.file.path_base != fbase {
+		return
+	}
+	if params.nlines < 1 || params.nlines > 1000 {
+		return
+	}
+	if g.out.len == 0 {
+		return
+	}
+	mut lines := 1
+	mut i := g.out.len - 1
+	for ; i >= 0; i-- {
+		if g.out[i] == `\n` {
+			if lines == params.nlines {
+				break
+			}
+			lines++
+		}
+	}
+	println('> g.trace_last_lines g.out last ${params.nlines} lines, pos: ${i + 1} ... g.out.len: ${g.out.len} ${params.msg}')
+	println(term.colorize(term.green, g.out.after(i + 1)))
+	println('`'.repeat(80))
 }
 
 pub fn (mut g Gen) get_array_depth(el_typ ast.Type) int {
