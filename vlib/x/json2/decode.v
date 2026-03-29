@@ -316,6 +316,13 @@ fn get_dynamic_from_element[T](_t T) []T {
 // decode_value decodes a value from the JSON nodes.
 @[manualfree]
 fn (mut decoder Decoder) decode_value[T](mut val T) ! {
+	$if T.unaliased_typ is voidptr {
+		// skip voidptr fields - they cannot be decoded from JSON
+		if decoder.current_node != unsafe { nil } {
+			decoder.current_node = decoder.current_node.next
+		}
+		return
+	} $else {
 	// Custom Decoders
 	$if val is StringDecoder {
 		struct_info := decoder.current_node.value
@@ -371,13 +378,7 @@ fn (mut decoder Decoder) decode_value[T](mut val T) ! {
 			return
 		}
 	}
-	$if T.unaliased_typ is voidptr {
-		// skip voidptr fields - they cannot be decoded from JSON
-		if decoder.current_node != unsafe { nil } {
-			decoder.current_node = decoder.current_node.next
-		}
-		return
-	} $else $if T.unaliased_typ is string {
+	$if T.unaliased_typ is string {
 		decoder.decode_string(mut val)!
 	} $else $if T.unaliased_typ is $sumtype {
 		decoder.decode_sumtype(mut val)!
@@ -598,7 +599,12 @@ fn (mut decoder Decoder) decode_value[T](mut val T) ! {
 												decoder.decode_error('`raw` attribute can only be used with string fields')!
 											}
 										} else {
-											$if field.typ is $option {
+											$if field.indirections > 0 {
+												// skip pointer fields
+												if decoder.current_node != unsafe { nil } {
+													decoder.current_node = decoder.current_node.next
+												}
+											} $else $if field.typ is $option {
 												// it would be nicer to do this at the start of the function
 												// but options cant be passed to generic functions
 												if decoder.current_node.value.value_kind == .null {
@@ -686,6 +692,7 @@ fn (mut decoder Decoder) decode_value[T](mut val T) ! {
 	if decoder.current_node != unsafe { nil } {
 		decoder.current_node = decoder.current_node.next
 	}
+	} // end $else voidptr
 }
 
 fn (mut decoder Decoder) decode_string[T](mut val T) ! {
@@ -807,10 +814,13 @@ fn (mut decoder Decoder) decode_array[T](mut val []T) ! {
 
 			mut array_element := T{}
 
-			$if T.unaliased_typ is $struct {
+			$if T.unaliased_typ is $struct || T.unaliased_typ is string || T.unaliased_typ is $float || T.unaliased_typ is $int || T.unaliased_typ is bool || T.unaliased_typ is $enum || T.unaliased_typ is $sumtype || T.unaliased_typ is $map || T.unaliased_typ is $array_dynamic || T.unaliased_typ is $array_fixed || T.unaliased_typ is voidptr {
 				decoder.decode_value(mut array_element)!
 			} $else {
-				decoder.decode_value(mut array_element)!
+				// skip unsupported element types (e.g. pointer types)
+				if decoder.current_node != unsafe { nil } {
+					decoder.current_node = decoder.current_node.next
+				}
 			}
 
 			val << array_element
