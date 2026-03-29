@@ -142,6 +142,9 @@ pub fn launch_tool(is_verbose bool, tool_name string, args []string) {
 		if tool_name == 'vfmt' {
 			compilation_command += ' -d vfmt '
 		}
+		if tool_name == 'vpm' {
+			compilation_command += ' -d use_openssl '
+		}
 		compilation_command += os.quoted_path(tool_source)
 		if is_verbose {
 			println('Compiling ${tool_name} with: "${compilation_command}"')

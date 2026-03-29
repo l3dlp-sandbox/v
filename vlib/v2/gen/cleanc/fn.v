@@ -1122,6 +1122,42 @@ fn (mut g Gen) try_specialize_generic_call_name(name string, call_args []ast.Exp
 			}
 		}
 	}
+	// Handle fully-qualified Decoder.decode_value calls inside comptime $for field loops.
+	// These calls have no _T_ suffix because the generic parameter is the field's type,
+	// not the outer T parameter. Use comptime_field_raw_type for correct token generation
+	// (handles pointer types → 'ptr' suffix, arrays → 'Array_' prefix, etc.).
+	if name in ['json2__Decoder__decode_value', 'Decoder__decode_value'] && call_args.len > 1 {
+		base_arg := unwrap_generic_arg(call_args[1])
+		// Try comptime field type first (most reliable for $for field loops)
+		if g.comptime_field_var != '' && base_arg is ast.SelectorExpr
+			&& base_arg.rhs.name == '__comptime_selector__' {
+			if g.comptime_field_raw_type !is types.Void {
+				token := g.generic_specialization_token_from_type(g.comptime_field_raw_type)
+				if candidate := g.find_specialized_call_name('json2__Decoder__decode_value',
+					token)
+				{
+					return candidate
+				}
+			}
+		}
+		// Fallback: infer from argument C type
+		mut arg_type_name := g.get_expr_type(base_arg).trim_space()
+		if arg_type_name != '' && arg_type_name != 'int' {
+			// Convert C type to specialization token:
+			// "ui__UI*" → "ui_UIptr", "sync__RwMutex" → "sync_RwMutex"
+			mut token := ''
+			if arg_type_name.ends_with('*') {
+				token = sanitize_generic_token_part(arg_type_name.trim_right('*')) + 'ptr'
+			} else {
+				token = sanitize_generic_token_part(arg_type_name)
+			}
+			if candidate := g.find_specialized_call_name('json2__Decoder__decode_value',
+				token)
+			{
+				return candidate
+			}
+		}
+	}
 	if name in ['Encoder__encode_value_T', 'json2__Encoder__encode_value_T', 'Encoder__encode_value', 'json2__Encoder__encode_value']
 		&& call_args.len > 1 {
 		base_arg := if call_args[1] is ast.ModifierExpr {
