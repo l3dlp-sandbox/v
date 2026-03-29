@@ -535,6 +535,14 @@ fn (g &Gen) option_result_payload_ready(val_type string) bool {
 	if val_type == 'map' || val_type.starts_with('Map_') || val_type in g.map_aliases {
 		return 'body_map' in g.emitted_types
 	}
+	// Nested option/result types: _result__option_T wraps _option_T as payload.
+	// Check if the inner option/result struct has been emitted already.
+	if val_type.starts_with('_option_') {
+		return val_type in g.emitted_option_structs
+	}
+	if val_type.starts_with('_result_') {
+		return val_type in g.emitted_result_structs
+	}
 	body_key := 'body_${val_type}'
 	enum_key := 'enum_${val_type}'
 	alias_key := 'alias_${val_type}'
@@ -1374,6 +1382,15 @@ fn (g &Gen) types_type_to_c(t types.Type) string {
 				}
 				return 'f64'
 			}
+			// Module-qualified generic placeholder: e.g. json2__T
+			if name.contains('__') && g.active_generic_types.len > 0 {
+				bare := name.all_after_last('__')
+				if is_generic_placeholder_type_name(bare) {
+					if concrete := g.resolve_active_generic_type(bare) {
+						return g.types_type_to_c(concrete)
+					}
+				}
+			}
 			if g.is_module_local_type(name) {
 				return '${g.cur_module}__${name}'
 			}
@@ -1838,12 +1855,30 @@ fn (mut g Gen) get_expr_type(node ast.Expr) string {
 	// For IndexExpr on pointer-to-pointer or pointer-to-string types, prefer raw-type-based
 	// inference over env (env may store the wrong type, e.g. char instead of char*).
 	if node is ast.IndexExpr {
+		// Unwrap ParenExpr to get the actual LHS identifier
+		idx_lhs := if node.lhs is ast.ParenExpr { node.lhs.expr } else { node.lhs }
 		// Cross-check: if LHS has a known local C type ending in **, derive element type
-		if node.lhs is ast.Ident {
-			if local_type := g.get_local_var_c_type(node.lhs.name) {
+		if idx_lhs is ast.Ident {
+			if local_type := g.get_local_var_c_type(idx_lhs.name) {
 				if local_type.ends_with('**') {
 					return local_type[..local_type.len - 1]
 				}
+				// In generic specializations, derive element type from the container's
+				// correctly-specialized local type rather than env lookup.
+				if g.active_generic_types.len > 0 && local_type.starts_with('Array_')
+					&& !local_type.starts_with('Array_fixed_') {
+					return local_type['Array_'.len..].trim_right('*')
+				}
+			}
+		}
+		// Transformer-lowered array indexing: ((ElemType*)arr.data)[idx]
+		// The LHS is a CastExpr wrapping a SelectorExpr on the array's .data field.
+		// In generic specializations, derive element type from the cast target type
+		// which correctly resolves T via active_generic_types.
+		if g.active_generic_types.len > 0 && node.lhs is ast.CastExpr {
+			cast_type := g.expr_type_to_c(node.lhs.typ)
+			if cast_type.ends_with('*') {
+				return cast_type[..cast_type.len - 1]
 			}
 		}
 		if lhs_raw := g.get_raw_type(node.lhs) {
@@ -1888,6 +1923,15 @@ fn (mut g Gen) get_expr_type(node ast.Expr) string {
 					}
 				}
 			}
+		}
+	}
+	// In generic specializations, derive ArrayInitExpr type from its type annotation
+	// (which correctly resolves T via active_generic_types) rather than env lookup
+	// (which may return the first specialization's type).
+	if g.active_generic_types.len > 0 && node is ast.ArrayInitExpr {
+		arr_type := g.expr_type_to_c(node.typ)
+		if arr_type != '' && arr_type != 'void' && arr_type != 'int' {
+			return arr_type
 		}
 	}
 	// Try environment lookup
@@ -2030,6 +2074,22 @@ fn (mut g Gen) get_expr_type(node ast.Expr) string {
 			field_type := g.selector_field_type(node)
 			if field_type != '' && field_type != t {
 				return field_type
+			}
+			return t
+		} else if node is ast.IndexExpr && g.active_generic_types.len > 0 {
+			// In generic specializations, env may return a type from a different
+			// specialization (e.g., 'string' when T=FriendData). Use the container's
+			// local/parameter type (which is correctly specialized) to derive the
+			// element type.
+			if node.lhs is ast.Ident {
+				if container_t := g.get_local_var_c_type(node.lhs.name) {
+					if container_t.starts_with('Array_') && !container_t.starts_with('Array_fixed_') {
+						elem := container_t['Array_'.len..].trim_right('*')
+						if elem != '' && elem != t {
+							return elem
+						}
+					}
+				}
 			}
 			return t
 		} else {
@@ -2389,6 +2449,16 @@ fn (mut g Gen) expr_type_to_c(e ast.Expr) string {
 					return g.types_type_to_c(concrete)
 				}
 				return 'f64'
+			}
+			// Module-qualified generic placeholder: e.g. json2__T from transformer's
+			// qualify_type_name. Strip the module prefix and resolve.
+			if name.contains('__') && g.active_generic_types.len > 0 {
+				bare := name.all_after_last('__')
+				if is_generic_placeholder_type_name(bare) {
+					if concrete := g.resolve_active_generic_type(bare) {
+						return g.types_type_to_c(concrete)
+					}
+				}
 			}
 			if g.is_module_local_type(name) {
 				return g.cur_module + '__' + name

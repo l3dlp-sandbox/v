@@ -7012,10 +7012,17 @@ fn (mut t Transformer) apply_smartcast_direct_ctx(original_expr ast.Expr, ctx Sm
 	is_native_backend := t.pref != unsafe { nil }
 		&& (t.pref.backend == .arm64 || t.pref.backend == .x64)
 	data_access := t.synth_selector(transformed_base, '_data', types.Type(types.voidptr_))
+	variant_field_name := if variant_simple.len > 0 && variant_simple[0] >= `A`
+		&& variant_simple[0] <= `Z` && !variant_simple.starts_with('Array_')
+		&& !variant_simple.starts_with('Map_') {
+		'_v${variant_simple}'
+	} else {
+		'_${variant_simple}'
+	}
 	variant_access := if is_native_backend {
 		data_access
 	} else {
-		t.synth_selector(data_access, '_${variant_simple}', types.Type(types.voidptr_))
+		t.synth_selector(data_access, variant_field_name, types.Type(types.voidptr_))
 	}
 
 	// For primitives, cast from pointer space back to value type
@@ -7124,10 +7131,17 @@ fn (mut t Transformer) apply_smartcast_receiver_ctx(sumtype_expr ast.Expr, ctx S
 	is_native_backend2 := t.pref != unsafe { nil }
 		&& (t.pref.backend == .arm64 || t.pref.backend == .x64)
 	data_access := t.synth_selector(transformed_base, '_data', types.Type(types.voidptr_))
+	variant_field_name2 := if variant_simple.len > 0 && variant_simple[0] >= `A`
+		&& variant_simple[0] <= `Z` && !variant_simple.starts_with('Array_')
+		&& !variant_simple.starts_with('Map_') {
+		'_v${variant_simple}'
+	} else {
+		'_${variant_simple}'
+	}
 	variant_access := if is_native_backend2 {
 		data_access
 	} else {
-		t.synth_selector(data_access, '_${variant_simple}', types.Type(types.voidptr_))
+		t.synth_selector(data_access, variant_field_name2, types.Type(types.voidptr_))
 	}
 	if t.is_eval_backend() {
 		return variant_access
@@ -7307,6 +7321,25 @@ fn (t &Transformer) smartcast_context_from_is_check(expr ast.InfixExpr) ?Smartca
 		}
 		if t.lookup_type(lookup_name) == none && t.lookup_type(variant_name) == none {
 			return none
+		}
+		// Enum comparison: if the LHS expression's type is an Enum, this is an
+		// enum `== .member` comparison, NOT a sum type is-check. Enum members
+		// like `.string` can collide with type names (e.g., `string`) and sum type
+		// variants, causing false matches. Check LHS type to disambiguate.
+		if lhs_type := t.resolve_expr_type(expr.lhs) {
+			lhs_base := t.unwrap_alias_and_pointer_type(lhs_type)
+			if lhs_base is types.Enum {
+				return none
+			}
+		}
+		// Enum dot-syntax: `.member` (SelectorExpr with EmptyExpr LHS) is
+		// EXCLUSIVELY used for enum comparisons, never for sum type is-checks.
+		// Sum type checks use full type names: `x is TypeName` or `x is mod.Type`.
+		if expr.rhs is ast.SelectorExpr {
+			rhs_sel := expr.rhs as ast.SelectorExpr
+			if rhs_sel.lhs is ast.EmptyExpr {
+				return none
+			}
 		}
 	}
 

@@ -21,15 +21,7 @@ fn (mut g Gen) set_file_module(file ast.File) {
 }
 
 fn (mut g Gen) gen_stmts(stmts []ast.Stmt) {
-	if g.cur_fn_name == 'decode_value' && stmts.len > 0 {
-		C.fprintf(C.stderr, c'[gen_stmts] cur_fn=%s stmts.len=%d\n', g.cur_fn_name.str,
-			stmts.len)
-	}
 	for i in 0 .. stmts.len {
-		if g.cur_fn_name == 'decode_value' {
-			valid := stmt_has_valid_data(stmts[i])
-			C.fprintf(C.stderr, c'[gen_stmts] stmt[%d] valid=%d\n', i, if valid { 1 } else { 0 })
-		}
 		g.gen_stmt(stmts[i])
 	}
 }
@@ -459,7 +451,7 @@ fn (mut g Gen) gen_stmt(node ast.Stmt) {
 
 fn (mut g Gen) gen_comptime_stmt(node ast.ComptimeStmt) {
 	if os.getenv('V2_DEBUG_COMPTIME') != '' {
-		eprintln('[gen_comptime_stmt] fn=${g.cur_fn_name}')
+		eprintln('[gen_comptime_stmt] fn=${g.cur_fn_name} inner_type=${node.stmt.type_name()}')
 	}
 	inner := node.stmt
 	if inner is ast.ForStmt {
@@ -485,7 +477,7 @@ fn (mut g Gen) gen_comptime_stmt(node ast.ComptimeStmt) {
 fn (mut g Gen) gen_comptime_if_stmt(node ast.IfExpr) {
 	result := g.eval_comptime_cond(node.cond)
 	if os.getenv('V2_DEBUG_COMPTIME') != '' {
-		eprintln('[comptime_if_stmt] cond=${node.cond.name()} result=${result} fn=${g.cur_fn_name}')
+		eprintln('[comptime_if_stmt] cond=${node.cond.name()} result=${result} fn=${g.cur_fn_name} active_generics=${g.active_generic_types}')
 	}
 	if result {
 		g.gen_stmts(node.stmts)

@@ -106,12 +106,16 @@ fn sanitize_staged_c_source(c_source string) string {
 	// Generic function specialization: convert_voidptr_to_t_T -> convert_voidptr_to_t_f64
 	source = source.replace('sync__convert_voidptr_to_t_T(', 'sync__convert_voidptr_to_t_f64(')
 	source = ensure_string_eq_impl(source)
-	// ObjC .m file references g_vui_webview_cookie_val as a global variable.
-	// The cleanc backend uses DarwinWebViewState singleton instead.
-	// Add the global so the .m file can link against it.
-	if !source.contains('g_vui_webview_cookie_val')
-		&& source.contains('webview__darwin_webview_state') {
-		source = source + '\nstring g_vui_webview_cookie_val;\n'
+	// ObjC .m files reference ui__webview__DarwinWebViewState struct and accessor.
+	// This type doesn't exist in V source — the .m files use it for cookie interop.
+	// Emit the struct, global instance, and accessor function so .m files can link.
+	if source.contains('ui__webview__DarwinWebViewState')
+		&& !source.contains('struct ui__webview__DarwinWebViewState {') {
+		source = source + '
+struct ui__webview__DarwinWebViewState { string cookie_val; };
+static ui__webview__DarwinWebViewState _g_darwin_webview_state;
+ui__webview__DarwinWebViewState* ui__webview__darwin_webview_state(void) { return &_g_darwin_webview_state; }
+'
 	}
 	return source
 }

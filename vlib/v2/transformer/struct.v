@@ -206,10 +206,17 @@ fn (mut t Transformer) apply_smartcast_field_access_ctx(sumtype_expr ast.Expr, f
 	is_native_backend := t.pref != unsafe { nil }
 		&& (t.pref.backend == .arm64 || t.pref.backend == .x64)
 	data_access := t.synth_selector(transformed_base, '_data', types.Type(types.voidptr_))
+	variant_field := if variant_simple.len > 0 && variant_simple[0] >= `A`
+		&& variant_simple[0] <= `Z` && !variant_simple.starts_with('Array_')
+		&& !variant_simple.starts_with('Map_') {
+		'_v${variant_simple}'
+	} else {
+		'_${variant_simple}'
+	}
 	variant_access := if is_native_backend {
 		data_access
 	} else {
-		t.synth_selector(data_access, '_${variant_simple}', types.Type(types.voidptr_))
+		t.synth_selector(data_access, variant_field, types.Type(types.voidptr_))
 	}
 	if t.is_eval_backend() {
 		return t.synth_selector_from_struct(variant_access, field_name, mangled_variant)

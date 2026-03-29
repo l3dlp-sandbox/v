@@ -113,6 +113,9 @@ fn normalize_c_directive_value(name string, raw string, file_name string, vroot 
 	if value.contains('@VMODROOT') {
 		value = value.replace('@VMODROOT', find_vmod_root_for_file(file_name))
 	}
+	if value.contains('@VROOT') {
+		value = value.replace('@VROOT', find_vmod_root_for_file(file_name))
+	}
 	if value.contains('@VEXEROOT') {
 		value = value.replace('@VEXEROOT', vroot)
 	}
@@ -214,6 +217,18 @@ fn (mut g Gen) emit_deferred_m_includes() {
 	// Skip .m includes when compiling as shared library (avoids duplicate ObjC classes)
 	if g.pref != unsafe { nil } && g.pref.is_shared_lib {
 		return
+	}
+	if g.deferred_m_includes.len > 0 {
+		// .m files from V1 modules use builtin__ prefixed function names
+		g.sb.writeln('#ifndef builtin__tos_clone')
+		g.sb.writeln('#define builtin__tos_clone tos_clone')
+		g.sb.writeln('#endif')
+		g.sb.writeln('#ifndef builtin__tos2')
+		g.sb.writeln('#define builtin__tos2 tos2')
+		g.sb.writeln('#endif')
+		g.sb.writeln('#ifndef builtin__string_clone')
+		g.sb.writeln('#define builtin__string_clone string__clone')
+		g.sb.writeln('#endif')
 	}
 	for line in g.deferred_m_includes {
 		g.sb.writeln(line)

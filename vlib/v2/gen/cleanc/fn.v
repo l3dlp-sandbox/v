@@ -1000,6 +1000,16 @@ fn infer_generic_type_bindings_from_param(param ast.Expr, concrete types.Type, g
 	}
 }
 
+fn unwrap_generic_arg(e ast.Expr) ast.Expr {
+	if e is ast.ModifierExpr {
+		return unwrap_generic_arg(e.expr)
+	}
+	if e is ast.PrefixExpr && e.op == .amp {
+		return unwrap_generic_arg(e.expr)
+	}
+	return e
+}
+
 fn direct_generic_placeholder_name(e ast.Expr) string {
 	match e {
 		ast.Ident {
@@ -1132,6 +1142,21 @@ fn (mut g Gen) try_specialize_generic_call_name(name string, call_args []ast.Exp
 		}
 	}
 	if g.active_generic_types.len > 0 {
+		// Handle call names that already have a baked-in concrete type from the
+		// first specialization (e.g., decode_value_T_FriendData). Replace the
+		// _T_<old_type> suffix with _T_<new_concrete_type>.
+		for param_name, concrete in g.active_generic_types {
+			marker := '_${param_name}_'
+			if idx := name.index(marker) {
+				base := name[..idx]
+				new_suffix := '_T_${g.generic_specialization_token_from_type(concrete)}'
+				candidate := base + new_suffix
+				if candidate in g.fn_param_is_ptr || candidate in g.fn_return_types {
+					return candidate
+				}
+			}
+		}
+		// Fallback: try replacing bare generic param names in underscore-split parts
 		mut parts := name.split('_')
 		mut changed := false
 		for i, part in parts {
@@ -1201,11 +1226,7 @@ fn (mut g Gen) try_specialize_generic_call_name(name string, call_args []ast.Exp
 			if direct_placeholder != param_name {
 				continue
 			}
-			base_arg := if call_args[arg_idx] is ast.ModifierExpr {
-				(call_args[arg_idx] as ast.ModifierExpr).expr
-			} else {
-				call_args[arg_idx]
-			}
+			base_arg := unwrap_generic_arg(call_args[arg_idx])
 			mut arg_type_name := g.get_expr_type(base_arg).trim_space()
 			if (arg_type_name == '' || arg_type_name == 'int') && base_arg is ast.Ident {
 				arg_type_name = (g.get_local_var_c_type(base_arg.name) or { '' }).trim_space()
@@ -1216,7 +1237,13 @@ fn (mut g Gen) try_specialize_generic_call_name(name string, call_args []ast.Exp
 				}
 			}
 			arg_type_name = arg_type_name.trim_right('*')
-			if arg_type_name == '' || arg_type_name == 'int' {
+			if arg_type_name == '' {
+				continue
+			}
+			// Allow 'int' as a legitimate type for generic specialization when
+			// active_generic_types explicitly maps to int, or when the arg is
+			// a pointer-to-generic-param (e.g., &val where val: &T, T=int).
+			if arg_type_name == 'int' && g.active_generic_types.len == 0 {
 				continue
 			}
 			mut candidate_types := [arg_type_name]
@@ -3835,15 +3862,8 @@ fn (mut g Gen) call_expr(lhs ast.Expr, args []ast.Expr) {
 	mut embedded_receiver_owner := ''
 	call_args << args
 	if lhs is ast.Ident {
-		if lhs.name.contains('get_or_panic')
-			|| (lhs.name.contains('get') && lhs.name.contains('ui_TextBox')) {
-			eprintln('[DBG call_expr IDENT] name=${lhs.name}')
-		}
 		name = sanitize_fn_ident(lhs.name)
 	} else if lhs is ast.SelectorExpr {
-		if lhs.rhs.name.contains('get_or_panic') || lhs.rhs.name.contains('get_T_') {
-			eprintln('[DBG call_expr SEL] rhs.name=${lhs.rhs.name} lhs.lhs=${lhs.lhs.name()}')
-		}
 		if lhs.rhs.name in ['hash_fn', 'key_eq_fn', 'clone_fn', 'free_fn'] {
 			base_type := g.method_receiver_base_type(lhs.lhs)
 			if base_type == 'map' || base_type.starts_with('Map_') {

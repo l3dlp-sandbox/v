@@ -269,6 +269,21 @@ fn (mut g Gen) array_append_elem_type(lhs ast.Expr, rhs ast.Expr) (bool, string)
 			elem_type = rhs_type
 		}
 	}
+	// Resolve generic placeholder types (e.g. json2__T -> FriendData).
+	// This happens inside generic function specializations where []T is
+	// represented as Array_<module>__T in string form.
+	if elem_type != '' && g.active_generic_types.len > 0 {
+		bare_name := if elem_type.contains('__') {
+			elem_type.all_after_last('__')
+		} else {
+			elem_type
+		}
+		if is_generic_placeholder_type_name(bare_name) {
+			if concrete := g.resolve_active_generic_type(bare_name) {
+				elem_type = g.types_type_to_c(concrete)
+			}
+		}
+	}
 	if elem_type == '' {
 		elem_type = 'int'
 	}

@@ -766,7 +766,31 @@ fn (mut t Transformer) transform_match_expr(expr ast.MatchExpr) ast.Expr {
 				|| first_cond is ast.StringInterLiteral {
 				sumtype_name = ''
 			}
+			// Enum dot-syntax: .member (SelectorExpr with empty LHS) is NOT a sum type match
+			if first_cond is ast.SelectorExpr && first_cond.lhs is ast.EmptyExpr {
+				sumtype_name = ''
+			}
 		}
+	}
+	// Double-check: if sumtype_name resolves to an Enum, clear it
+	if sumtype_name != '' {
+		if st := t.lookup_type(sumtype_name) {
+			if st is types.Enum {
+				sumtype_name = ''
+			}
+		}
+		// Also try unqualified name
+		if sumtype_name != '' && sumtype_name.contains('__') {
+			short_name := sumtype_name.all_after_last('__')
+			if st := t.lookup_type(short_name) {
+				if st is types.Enum {
+					sumtype_name = ''
+				}
+			}
+		}
+	}
+	if sumtype_name.contains('ValueKind') {
+		eprintln('[DBG match] sumtype_name=${sumtype_name} expr=${smartcast_expr}')
 	}
 
 	if sumtype_name != '' {
@@ -804,9 +828,9 @@ fn (mut t Transformer) transform_match_expr(expr ast.MatchExpr) ast.Expr {
 							c_variant_name_full = c.rhs.name
 						}
 					} else if c is ast.Type {
-						// Handle type variants like []ast.Attribute
-						c_variant_name = t.type_variant_name(c)
-						c_variant_name_full = t.type_variant_name_full(c)
+						// Handle type variants like []ast.Attribute, map[string]Value
+						c_variant_name = t.type_variant_name_qualified(c)
+						c_variant_name_full = t.type_variant_name_qualified(c)
 					}
 
 					if c_variant_name == '' {
@@ -863,9 +887,48 @@ fn (mut t Transformer) transform_match_expr(expr ast.MatchExpr) ast.Expr {
 						if c_variant_name.starts_with('Array_fixed_') && v.starts_with('[') {
 							// TODO: implement fixed array matching if needed
 						}
-						// Handle map variant matching
+						// Handle map variant matching:
+						// c_variant_name is 'Map_string_Value' (C format)
+						// v is 'map[string]Value' (V format from types.Map.name())
 						if c_variant_name.starts_with('Map_') && v.starts_with('map[') {
-							// TODO: implement map matching if needed
+							// Parse map[K]V → K, V from V format
+							v_inner := v[4..] // after 'map['
+							if bracket_idx := v_inner.index(']') {
+								v_key := v_inner[..bracket_idx]
+								v_val := v_inner[bracket_idx + 1..]
+								c_rest := c_variant_name[4..] // after 'Map_'
+								v_key_short := if v_key.contains('.') {
+									v_key.all_after_last('.')
+								} else {
+									v_key
+								}
+								v_val_short := if v_val.contains('.') {
+									v_val.all_after_last('.')
+								} else {
+									v_val
+								}
+								c_rest_short := c_rest.replace('__', '.')
+								c_rest_short2 := if c_rest_short.contains('.') {
+									// Get just the short type names
+									parts := c_rest.split('_')
+									mut short_parts := []string{}
+									for p in parts {
+										if p.contains('__') {
+											short_parts << p.all_after_last('__')
+										} else {
+											short_parts << p
+										}
+									}
+									short_parts.join('_')
+								} else {
+									c_rest
+								}
+								if c_rest == '${v_key}_${v_val}'
+									|| c_rest_short2 == '${v_key_short}_${v_val_short}' {
+									c_tag = i
+									break
+								}
+							}
 						}
 					}
 
@@ -1863,6 +1926,7 @@ fn (mut t Transformer) transform_infix_expr(expr ast.InfixExpr) ast.Expr {
 	if expr.op in [.key_is, .not_is, .eq, .ne] {
 		mut variant_name := ''
 		mut variant_module := ''
+		mut is_enum_dot_syntax := false
 		if expr.rhs is ast.Ident {
 			variant_name = (expr.rhs as ast.Ident).name
 		} else if expr.rhs is ast.SelectorExpr {
@@ -1870,12 +1934,18 @@ fn (mut t Transformer) transform_infix_expr(expr ast.InfixExpr) ast.Expr {
 			variant_name = sel.rhs.name
 			if sel.lhs is ast.Ident {
 				variant_module = (sel.lhs as ast.Ident).name
+			} else if sel.lhs is ast.EmptyExpr {
+				// `.member` enum dot-syntax: only used for enum comparisons,
+				// never for sum type is-checks. Skip sum type tag generation
+				// for `== .member` and `!= .member` to avoid false matches
+				// where enum member names collide with type names (e.g., `.string`).
+				is_enum_dot_syntax = true
 			}
 		} else if expr.rhs is ast.Type {
 			// Handle complex type expressions like []Any, map[string]Any
 			variant_name = t.type_expr_to_variant_name(expr.rhs)
 		}
-		if variant_name != '' {
+		if variant_name != '' && !is_enum_dot_syntax {
 			mut sumtype_name := t.get_sumtype_name_for_expr(expr.lhs)
 			if sumtype_name == '' {
 				sumtype_name = t.find_sumtype_for_variant(variant_name)

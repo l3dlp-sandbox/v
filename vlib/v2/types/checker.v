@@ -2168,13 +2168,28 @@ fn (mut c Checker) stmt(stmt ast.Stmt) {
 			}
 		}
 		ast.ComptimeStmt {
-			c.stmt(stmt.stmt)
+			// Skip comptime $for loops over T.methods / T.fields —
+			// V2 doesn't expand these, and checking them would fail
+			// because T.methods/T.fields aren't real field accesses.
+			if !c.is_comptime_for_loop(stmt.stmt) {
+				c.stmt(stmt.stmt)
+			}
 		}
 		ast.LabelStmt {
 			c.stmt(stmt.stmt)
 		}
 		else {}
 	}
+}
+
+fn (c &Checker) is_comptime_for_loop(stmt ast.Stmt) bool {
+	if stmt is ast.ForStmt && stmt.init is ast.ForInStmt {
+		if stmt.init.expr is ast.SelectorExpr {
+			return stmt.init.expr.rhs.name == 'methods'
+				|| stmt.init.expr.rhs.name == 'fields'
+		}
+	}
+	return false
 }
 
 fn (mut c Checker) stmt_list(stmts []ast.Stmt) {
@@ -3224,6 +3239,8 @@ fn (mut c Checker) match_expr(expr ast.MatchExpr, used_as_expr bool) Type {
 				if cond is ast.SelectorExpr && cond.lhs is ast.EmptyExpr {
 					continue
 				}
+				c.apply_smartcast(expr_unwrapped, cond_type)
+			} else if cond is ast.Type {
 				c.apply_smartcast(expr_unwrapped, cond_type)
 			}
 		}
@@ -4810,13 +4827,14 @@ fn (mut c Checker) find_field_or_method(t Type, raw_name string) !Type {
 		SumType {
 			// if !c.expecting_method {
 			mut prev_type := Type(nil_)
+			mut all_have_field := true
 			for i, variant in t.variants {
 				if variant is Struct {
 					mut has_field := false
 					for field in variant.fields {
 						if field.name == name {
 							has_field = true
-							if i > 0 && field.typ.name() != prev_type.name() {
+							if i > 0 && prev_type !is Nil && field.typ.name() != prev_type.name() {
 								return error('field ${name} must have the same type for all variants of ${t.name()}')
 							}
 							prev_type = field.typ
@@ -4824,11 +4842,19 @@ fn (mut c Checker) find_field_or_method(t Type, raw_name string) !Type {
 						}
 					}
 					if !has_field {
-						return error('not all variants of ${t.name()} have the field ${name}')
+						all_have_field = false
+						break
 					}
 				}
 			}
-			return prev_type
+			if all_have_field && prev_type !is Nil {
+				return prev_type
+			}
+			// Field not found in all variants — check for universal methods
+			if name == 'str' {
+				return fn_with_return_type(empty_fn_type(), Type(string_))
+			}
+			// Fall through to method lookup below
 			// }
 		}
 		Thread {

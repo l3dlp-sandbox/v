@@ -777,9 +777,7 @@ fn (mut g Gen) gen_sum_type_decl(node ast.TypeDecl) {
 	// Track variant names for sum type cast generation
 	mut variant_names := []string{}
 	for i, variant in node.variants {
-		vname := g.get_variant_field_name(variant, i)
-		// Strip leading underscore from field name to get the type name
-		variant_names << if vname.len > 1 && vname[0] == `_` { vname[1..] } else { vname }
+		variant_names << g.get_variant_short_name(variant, i)
 	}
 	g.sum_type_variants[name] = variant_names
 
@@ -795,14 +793,48 @@ fn (mut g Gen) gen_sum_type_decl(node ast.TypeDecl) {
 	g.sb.writeln('')
 }
 
-fn (mut g Gen) get_variant_field_name(variant ast.Expr, idx int) string {
+// c_variant_field_name prepends '_' to a variant short name, escaping C reserved
+// identifiers (C99 reserves _[A-Z]* e.g. _Bool, _Complex, _Atomic).
+fn c_variant_field_name(short_name string) string {
+	if short_name.len > 0 && short_name[0] >= `A` && short_name[0] <= `Z`
+		&& !short_name.starts_with('Array_') && !short_name.starts_with('Map_') {
+		return '_v${short_name}'
+	}
+	return '_${short_name}'
+}
+
+// get_variant_short_name returns the original (unescaped) short name for a sum
+// type variant, used for type resolution in sum_type_variants.
+fn (mut g Gen) get_variant_short_name(variant ast.Expr, idx int) string {
 	if variant is ast.Ident {
-		return '_${variant.name}'
+		return variant.name
 	} else if variant is ast.SelectorExpr {
 		if variant.lhs is ast.Ident {
-			return '_${variant.lhs.name}__${variant.rhs.name}'
+			return '${variant.lhs.name}__${variant.rhs.name}'
 		}
-		return '_${variant.rhs.name}'
+		return variant.rhs.name
+	} else if variant is ast.Type {
+		if variant is ast.ArrayType {
+			elem := mangle_alias_component(g.field_type_name(variant.elem_type))
+			return 'Array_${elem}'
+		}
+		if variant is ast.MapType {
+			key := mangle_alias_component(g.field_type_name(variant.key_type))
+			val := mangle_alias_component(g.field_type_name(variant.value_type))
+			return 'Map_${key}_${val}'
+		}
+	}
+	return 'v${idx}'
+}
+
+fn (mut g Gen) get_variant_field_name(variant ast.Expr, idx int) string {
+	if variant is ast.Ident {
+		return c_variant_field_name(variant.name)
+	} else if variant is ast.SelectorExpr {
+		if variant.lhs is ast.Ident {
+			return c_variant_field_name('${variant.lhs.name}__${variant.rhs.name}')
+		}
+		return c_variant_field_name(variant.rhs.name)
 	} else if variant is ast.Type {
 		if variant is ast.ArrayType {
 			elem := mangle_alias_component(g.field_type_name(variant.elem_type))
@@ -972,7 +1004,7 @@ fn (mut g Gen) gen_sum_wrapped_init_field(sum_type_name string, init_expr ast.In
 
 fn (mut g Gen) gen_sum_type_wrap(type_name string, field_name string, tag int, is_primitive bool, expr ast.Expr, inner_type string) {
 	_ = is_primitive
-	g.sb.write_string('((${type_name}){._tag = ${tag}, ._data._${field_name} = ')
+	g.sb.write_string('((${type_name}){._tag = ${tag}, ._data.${c_variant_field_name(field_name)} = ')
 	mut resolved_type := inner_type
 	if resolved_type == '' || resolved_type == 'void*' || resolved_type == 'int'
 		|| resolved_type == type_name {
@@ -1090,6 +1122,12 @@ fn (mut g Gen) gen_sum_variant_field_selector(node ast.SelectorExpr) bool {
 	if lhs_sum_type == '' {
 		lhs_sum_type = g.get_expr_type(node.lhs)
 	}
+	// If still not found, try the local variable type as a sum type lookup
+	if lhs_sum_type == '' && node.lhs is ast.Ident {
+		if local_t := g.get_local_var_c_type(node.lhs.name) {
+			lhs_sum_type = local_t
+		}
+	}
 	mut variants := []string{}
 	if vs := g.sum_type_variants[lhs_sum_type] {
 		variants = vs.clone()
@@ -1110,6 +1148,7 @@ fn (mut g Gen) gen_sum_variant_field_selector(node ast.SelectorExpr) bool {
 	}
 	mut matched_full := ''
 	mut matched_short := ''
+	mut matched_field_type := ''
 	for variant in variants {
 		variant_short := if variant.contains('__') { variant.all_after_last('__') } else { variant }
 		mut variant_full := variant
@@ -1124,12 +1163,18 @@ fn (mut g Gen) gen_sum_variant_field_selector(node ast.SelectorExpr) bool {
 		key_full := '${variant_full}.${node.rhs.name}'
 		key_short := '${variant_short}.${node.rhs.name}'
 		if key_full in g.struct_field_types || key_short in g.struct_field_types {
-			if matched_full != '' && matched_full != variant_full {
-				// Ambiguous field across multiple variants.
+			// For common fields (shared by all variants), any variant can be used
+			// as long as the field type is the same. Only reject if types differ.
+			ft := g.struct_field_types[key_full] or { g.struct_field_types[key_short] or { '' } }
+			if matched_full == '' {
+				matched_full = variant_full
+				matched_short = variant_short
+				matched_field_type = ft
+			} else if ft != matched_field_type {
+				// Ambiguous: same field name but different types across variants.
 				return false
 			}
-			matched_full = variant_full
-			matched_short = variant_short
+			// Same field type - keep first match (any variant works for common fields)
 		}
 	}
 	if matched_full == '' {
@@ -1140,7 +1185,7 @@ fn (mut g Gen) gen_sum_variant_field_selector(node ast.SelectorExpr) bool {
 	sep := if g.expr_is_pointer(node.lhs) { '->' } else { '.' }
 	g.sb.write_string('(((${matched_full}*)(((')
 	g.expr(node.lhs)
-	g.sb.write_string(')${sep}_data._${matched_short})))')
+	g.sb.write_string(')${sep}_data.${c_variant_field_name(matched_short)})))')
 	if owner != '' {
 		g.sb.write_string('->${escape_c_keyword(owner)}.${field_name}')
 	} else {
@@ -1492,9 +1537,8 @@ fn (mut g Gen) gen_init_expr(node ast.InitExpr) {
 			continue
 		}
 		if type_name in g.sum_type_variants && field.name.starts_with('_data._') {
-			field_name := field.name
-			g.sb.write_string('.${field_name} = ')
-			variant_name := field_name.all_after('_data._')
+			variant_name := field.name.all_after('_data._')
+			g.sb.write_string('._data.${c_variant_field_name(variant_name)} = ')
 			mut inner_type := g.get_expr_type(field.value)
 			mut resolved_type := inner_type
 			if inner_type == '' || inner_type == 'void*' || inner_type == 'int'

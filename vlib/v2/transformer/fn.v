@@ -1854,6 +1854,13 @@ fn (t &Transformer) resolve_method_call_name(receiver ast.Expr, method_name stri
 				}
 				return '${specific_name}__${method_name}'
 			}
+			// For map types: if the method is NOT on generic 'map' but on
+			// a specific map type (e.g., map[string]Any.to_toml()), use the
+			// specific C type name (e.g., Map_string_toml__Any).
+			if c_prefix == 'map' && t.lookup_method_cached('map', method_name) == none {
+				specific_name := t.type_to_c_name(base_type)
+				return '${specific_name}__${method_name}'
+			}
 			return '${c_prefix}__${method_name}'
 		}
 	}

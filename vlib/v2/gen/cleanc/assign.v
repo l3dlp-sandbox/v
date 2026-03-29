@@ -363,6 +363,28 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 			}
 		}
 		mut typ := g.get_expr_type(rhs)
+		// In generic specializations, get_expr_type may return types from the
+		// first specialization. Override with the RHS's own type annotation.
+		mut generic_type_resolved := false
+		if g.active_generic_types.len > 0 {
+			if rhs is ast.InitExpr {
+				init_type := g.expr_type_to_c(rhs.typ)
+				is_generic_rhs := rhs.typ is ast.Ident
+					&& is_generic_placeholder_type_name(rhs.typ.name)
+				if init_type != '' && init_type != 'void'
+					&& (init_type != 'int' || is_generic_rhs) {
+					typ = init_type
+					generic_type_resolved = true
+				}
+			} else if rhs is ast.CallExpr {
+				if ret := g.get_call_return_type(rhs.lhs, rhs.args) {
+					if ret != '' && ret != 'int' {
+						typ = ret
+						generic_type_resolved = true
+					}
+				}
+			}
+		}
 		// For Ident RHS referencing a struct-typed constant (e.g., `col := no_color`
 		// where no_color is `#define`d as a Color struct literal), use the const type.
 		if (typ == 'int' || typ == '') && rhs is ast.Ident {
@@ -540,7 +562,7 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 				type_from_tuple_field = sel_lhs.name.starts_with('_tuple_t')
 			}
 		}
-		if !elem_type_from_array && !type_from_tuple_field && name != ''
+		if !elem_type_from_array && !type_from_tuple_field && !generic_type_resolved && name != ''
 			&& g.cur_fn_scope != unsafe { nil } {
 			if obj := g.cur_fn_scope.lookup_parent(name, 0) {
 				if obj !is types.Module {
@@ -550,8 +572,17 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 						generic_container_fallback :=
 							(typ == 'array' && scoped_type.starts_with('Array_'))
 							|| (typ == 'map' && scoped_type.starts_with('Map_'))
+						// In generic specializations, env-based type may return a type
+						// from a different specialization. Prefer the scope-resolved type
+						// (which goes through active_generic_types resolution).
+						// But NOT if the type was already correctly resolved from the
+						// RHS expression type annotation (InitExpr/CallExpr).
+						generic_type_mismatch := g.active_generic_types.len > 0
+							&& !generic_type_resolved
+							&& scoped_type != typ && scoped_type != 'f64'
 						if (typ == '' || typ == 'int' || typ == 'int_literal' || typ == 'void*'
-							|| typ == 'voidptr' || generic_container_fallback) && scoped_type != ''
+							|| typ == 'voidptr' || generic_container_fallback
+							|| generic_type_mismatch) && scoped_type != ''
 							&& scoped_type !in ['int', 'void', 'void*', 'voidptr'] {
 							typ = scoped_type
 						}

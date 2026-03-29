@@ -1342,6 +1342,29 @@ fn (t &Transformer) type_variant_name_full(typ ast.Type) string {
 	return t.type_expr_name_full(typ)
 }
 
+// type_variant_name_qualified is like type_variant_name but qualifies same-module references.
+// Used for match arm smartcast contexts to match union field names.
+fn (t &Transformer) type_variant_name_qualified(typ ast.Type) string {
+	if typ is ast.ArrayType {
+		elem_name := t.type_expr_name_qualified(typ.elem_type)
+		return 'Array_${elem_name}'
+	}
+	if typ is ast.ArrayFixedType {
+		elem_name := t.type_expr_name_qualified(typ.elem_type)
+		mut len_str := '0'
+		if typ.len is ast.BasicLiteral {
+			len_str = typ.len.value
+		}
+		return 'Array_fixed_${elem_name}_${len_str}'
+	}
+	if typ is ast.MapType {
+		key_name := t.type_expr_name_qualified(typ.key_type)
+		val_name := t.type_expr_name_qualified(typ.value_type)
+		return 'Map_${key_name}_${val_name}'
+	}
+	return t.type_expr_name_qualified(typ)
+}
+
 // type_expr_name extracts the short type name from a type expression
 fn (t &Transformer) type_expr_name(expr ast.Expr) string {
 	if expr is ast.Ident {
@@ -1372,6 +1395,35 @@ fn (t &Transformer) type_expr_name_full(expr ast.Expr) string {
 	}
 	if expr is ast.Type {
 		return t.type_variant_name(expr)
+	}
+	return ''
+}
+
+// type_expr_name_qualified returns a module-qualified type name.
+// Unlike type_expr_name_full, this also qualifies same-module Ident references
+// (e.g., 'Value' → 'ast__Value' when cur_module is 'ast').
+fn (t &Transformer) type_expr_name_qualified(expr ast.Expr) string {
+	if expr is ast.Ident {
+		name := expr.name
+		if name in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64',
+			'byte', 'rune', 'f32', 'f64', 'usize', 'isize', 'bool', 'string',
+			'voidptr', 'charptr', 'byteptr'] {
+			return name
+		}
+		if t.cur_module != '' && t.cur_module != 'main' && t.cur_module != 'builtin' {
+			return '${t.cur_module}__${name}'
+		}
+		return name
+	}
+	if expr is ast.SelectorExpr {
+		if expr.lhs is ast.Ident {
+			mod := (expr.lhs as ast.Ident).name
+			return '${mod}__${expr.rhs.name}'
+		}
+		return expr.rhs.name
+	}
+	if expr is ast.Type {
+		return t.type_variant_name_qualified(expr)
 	}
 	return ''
 }
@@ -1576,7 +1628,7 @@ fn (t &Transformer) build_sumtype_init(transformed_value ast.Expr, variant_name 
 	// - "ast__InfixExpr" → "InfixExpr" (strip module prefix)
 	// - "[]ast__Attribute" → "Array_ast__Attribute" (array variant)
 	// - "map[K]V" → "Map_K_V" (map variant)
-	short_variant := if variant_name.starts_with('[]') {
+	short_variant_raw := if variant_name.starts_with('[]') {
 		'Array_${variant_name[2..]}'
 	} else if variant_name.starts_with('map[') {
 		// map[K]V → Map_K_V
@@ -1593,6 +1645,15 @@ fn (t &Transformer) build_sumtype_init(transformed_value ast.Expr, variant_name 
 	} else {
 		variant_name
 	}
+	// Apply _v prefix for capitalized variant names (matching c_variant_field_name in cleanc)
+	// But NOT for Array_/Map_ composite types which already use _ prefix
+	short_variant := if short_variant_raw.len > 0 && short_variant_raw[0] >= `A`
+		&& short_variant_raw[0] <= `Z` && !short_variant_raw.starts_with('Array_')
+		&& !short_variant_raw.starts_with('Map_') {
+		'_v${short_variant_raw}'
+	} else {
+		'_${short_variant_raw}'
+	}
 	return ast.InitExpr{
 		typ:    ast.Ident{
 			name: sumtype_name
@@ -1606,7 +1667,7 @@ fn (t &Transformer) build_sumtype_init(transformed_value ast.Expr, variant_name 
 				}
 			},
 			ast.FieldInit{
-				name:  '_data._${short_variant}'
+				name:  '_data.${short_variant}'
 				value: boxed_value
 			},
 		]

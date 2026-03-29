@@ -1253,13 +1253,23 @@ fn (mut g Gen) gen_infix_expr(node &ast.InfixExpr) {
 		|| (rhs_is_string_ptr && lhs_type in ['int', 'int_literal', 'i64', 'u64', 'voidptr'])
 	rhs_is_nil2 := rhs_is_nil
 		|| (lhs_is_string_ptr && rhs_type in ['int', 'int_literal', 'i64', 'u64', 'voidptr'])
-	is_string_cmp := if lhs_is_nil2 || rhs_is_nil2 {
+	mut is_string_cmp := if lhs_is_nil2 || rhs_is_nil2 {
 		false
 	} else if node.lhs is ast.StringLiteral || node.rhs is ast.StringLiteral {
 		true
 	} else {
 		(lhs_type == 'string' || lhs_is_string_ptr) && (rhs_type == 'string' || rhs_is_string_ptr)
 			&& !g.is_enum_type(lhs_type) && !g.is_enum_type(rhs_type)
+	}
+	// In generic specializations, env-based type inference may return 'string'
+	// from the first specialization (T=string) for positions that should have
+	// the current concrete type. Cross-check with local/parameter types.
+	if is_string_cmp && g.active_generic_types.len > 0 {
+		if !g.generic_operand_is_string(node.lhs) {
+			is_string_cmp = false
+		} else if !g.generic_operand_is_string(node.rhs) {
+			is_string_cmp = false
+		}
 	}
 	// Override: string pointer compared with a numeric literal (null check)
 	// The checker may annotate `0` as `string` in `&string == 0` context,
@@ -1473,6 +1483,55 @@ fn (mut g Gen) gen_infix_expr(node &ast.InfixExpr) {
 	g.sb.write_string(')')
 }
 
+// generic_operand_is_string checks whether an expression is truly string-typed
+// in the current generic specialization context. Uses runtime_local_types and
+// parameter types (which are correctly specialized) rather than env lookups
+// (which may return types from the first specialization).
+fn (mut g Gen) generic_operand_is_string(expr ast.Expr) bool {
+	if expr is ast.StringLiteral {
+		return true
+	}
+	if expr is ast.Ident {
+		if local_t := g.get_local_var_c_type(expr.name) {
+			return local_t == 'string' || local_t == 'string*'
+		}
+		return true // unknown — trust the env
+	}
+	if expr is ast.IndexExpr {
+		// a[j] — derive element type from the container's local type
+		// Unwrap ParenExpr that transformer may add
+		idx_lhs := if expr.lhs is ast.ParenExpr { expr.lhs.expr } else { expr.lhs }
+		if idx_lhs is ast.Ident {
+			if container_t := g.get_local_var_c_type(idx_lhs.name) {
+				if container_t.starts_with('Array_') {
+					elem := container_t['Array_'.len..]
+					return elem == 'string'
+				}
+			}
+		}
+		// Transformer-lowered: ((T*)a.data)[idx] — CastExpr as LHS
+		if idx_lhs is ast.CastExpr {
+			cast_type := g.expr_type_to_c(idx_lhs.typ)
+			if cast_type.ends_with('*') {
+				return cast_type == 'string*' || cast_type == 'u8*' || cast_type == 'byte*'
+			}
+		}
+	}
+	if expr is ast.SelectorExpr {
+		field_type := g.selector_field_type(expr)
+		if field_type != '' {
+			return field_type == 'string'
+		}
+	}
+	// PrefixExpr: (*e) dereference — check the inner expression
+	if expr is ast.PrefixExpr {
+		if expr.op == .mul {
+			return g.generic_operand_is_string(expr.expr)
+		}
+	}
+	return true // unknown — trust the env
+}
+
 fn (mut g Gen) gen_string_cmp_operand(expr ast.Expr, is_string_ptr bool) {
 	if is_string_ptr {
 		g.sb.write_string('(*')
@@ -1554,6 +1613,15 @@ fn (mut g Gen) expr(node ast.Expr) {
 					true))
 			} else if node.name == '@LINE' {
 				g.sb.write_string('__LINE__')
+			} else if node.name == '@STRUCT' {
+				// @STRUCT returns the name of the enclosing struct for methods
+				struct_name := if g.cur_fn_name.contains('__') {
+					parts := g.cur_fn_name.split('__')
+					if parts.len >= 2 { parts[parts.len - 2] } else { '' }
+				} else {
+					''
+				}
+				g.sb.write_string(c_static_v_string_expr(struct_name))
 			} else if node.name == '@VCURRENTHASH' || node.name == '@VHASH' {
 				g.sb.write_string(c_static_v_string_expr(g.get_v_hash()))
 			} else if node.name == '@VEXE' {
@@ -1964,6 +2032,71 @@ fn (mut g Gen) expr(node ast.Expr) {
 			}
 		}
 		ast.CallExpr {
+			// In generic specializations, the transformer may have lowered
+			// `a == b` to `string__eq(a, b)` based on the first specialization
+			// where T=string. If the current specialization has non-string T,
+			// we need to emit the correct comparison for the actual type.
+			if g.active_generic_types.len > 0 && node.lhs is ast.Ident
+				&& node.lhs.name in ['string__eq', 'string__ne', 'string__lt', 'string__compare']
+				&& node.args.len == 2
+				&& (!g.generic_operand_is_string(node.args[0])
+				|| !g.generic_operand_is_string(node.args[1])) {
+				cmp_type := g.get_expr_type(node.args[0])
+				if cmp_type != '' && cmp_type != 'string' {
+					is_eq := node.lhs.name == 'string__eq'
+					is_ne := node.lhs.name == 'string__ne'
+					is_lt := node.lhs.name == 'string__lt'
+					// Primitive types: use == / != / < directly
+					if cmp_type in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'byte', 'rune', 'bool', 'usize', 'isize'] {
+						g.sb.write_string('(')
+						g.expr(node.args[0])
+						if is_eq {
+							g.sb.write_string(' == ')
+						} else if is_ne {
+							g.sb.write_string(' != ')
+						} else if is_lt {
+							g.sb.write_string(' < ')
+						} else {
+							g.sb.write_string(' - ')
+						}
+						g.expr(node.args[1])
+						g.sb.write_string(')')
+					} else if cmp_type == 'string*' || cmp_type == 'stringptr' {
+						// string pointer: dereference and use string__eq
+						g.sb.write_string(node.lhs.name)
+						g.sb.write_string('(*')
+						g.expr(node.args[0])
+						g.sb.write_string(', *')
+						g.expr(node.args[1])
+						g.sb.write_string(')')
+					} else {
+						// Struct types: use memcmp
+						if is_eq {
+							g.sb.write_string('(memcmp(&')
+							g.expr(node.args[0])
+							g.sb.write_string(', &')
+							g.expr(node.args[1])
+							g.sb.write_string(', sizeof(${cmp_type})) == 0)')
+						} else if is_ne {
+							g.sb.write_string('(memcmp(&')
+							g.expr(node.args[0])
+							g.sb.write_string(', &')
+							g.expr(node.args[1])
+							g.sb.write_string(', sizeof(${cmp_type})) != 0)')
+						} else if is_lt || node.lhs.name == 'string__compare' {
+							g.sb.write_string('memcmp(&')
+							g.expr(node.args[0])
+							g.sb.write_string(', &')
+							g.expr(node.args[1])
+							g.sb.write_string(', sizeof(${cmp_type}))')
+							if is_lt {
+								g.sb.write_string(' < 0')
+							}
+						}
+					}
+					return
+				}
+			}
 			g.call_expr(node.lhs, node.args)
 		}
 		ast.CallOrCastExpr {
@@ -2740,7 +2873,7 @@ fn (mut g Gen) gen_sum_narrowed_selector(node ast.SelectorExpr) bool {
 	// mismatches when the field type was a struct/array).
 	g.sb.write_string('(((${narrowed}*)(((')
 	g.expr(node.lhs)
-	g.sb.write_string(')._data._${variant_field})))')
+	g.sb.write_string(')._data.${c_variant_field_name(variant_field)})))')
 	if owner != '' {
 		g.sb.write_string('->${escape_c_keyword(owner)}.${field_name}')
 	} else {
@@ -2780,15 +2913,16 @@ fn (mut g Gen) gen_sum_narrowed_ident(node ast.Ident) bool {
 		return false
 	}
 	// Generate the extraction expression
+	vf := c_variant_field_name(variant_field)
 	if g.is_scalar_sum_payload_type(narrowed) {
 		// Scalar types: ((type)(intptr_t)(var._data._variant))
-		g.sb.write_string('((${narrowed})(intptr_t)(${node.name}._data._${variant_field}))')
+		g.sb.write_string('((${narrowed})(intptr_t)(${node.name}._data.${vf}))')
 	} else if narrowed == 'string' {
 		// String: same as struct dereference
-		g.sb.write_string('(*((${narrowed}*)(${node.name}._data._${variant_field})))')
+		g.sb.write_string('(*((${narrowed}*)(${node.name}._data.${vf})))')
 	} else {
 		// Struct types: (*(NarrowedType*)(var._data._Variant))
-		g.sb.write_string('(*((${narrowed}*)(${node.name}._data._${variant_field})))')
+		g.sb.write_string('(*((${narrowed}*)(${node.name}._data.${vf})))')
 	}
 	return true
 }
@@ -3692,12 +3826,12 @@ fn (mut g Gen) gen_comptime_expr(node ast.ComptimeExpr) {
 					return
 				}
 				'compile_error' {
-					msg := if node.expr.args.len > 0 {
-						comptime_string_arg(node.expr.args[0])
-					} else {
-						'compile error'
-					}
-					panic('comptime compile_error: ${msg}')
+					// $compile_error is a user-facing comptime error that should only
+					// trigger when the function is actually called with incompatible types.
+					// Since v2 may generate unreachable generic instantiations, treat
+					// compile_error as a no-op (like compile_warn) to avoid false panics.
+					g.sb.write_string(c_empty_v_string_expr())
+					return
 				}
 				'compile_warn' {
 					// Keep compilation moving; warnings are not surfaced by cleanc yet.
@@ -3717,8 +3851,8 @@ fn (mut g Gen) gen_comptime_expr(node ast.ComptimeExpr) {
 					return
 				}
 				'compile_error' {
-					msg := comptime_string_arg(node.expr.expr)
-					panic('comptime compile_error: ${msg}')
+					g.sb.write_string(c_empty_v_string_expr())
+					return
 				}
 				'compile_warn' {
 					g.sb.write_string(c_empty_v_string_expr())
@@ -3902,13 +4036,14 @@ fn (mut g Gen) gen_as_cast_expr(node ast.AsCastExpr) {
 		g.sb.write_string('((${type_name})(${inner_str}))')
 		return
 	}
-	marker := ')->_data._${short_name}'
+	cvf := c_variant_field_name(short_name)
+	marker := ')->_data.${cvf}'
 	if idx := inner_str.index(marker) {
 		simplified := inner_str[..idx + 1]
 		g.sb.write_string('(*(${simplified}))')
 		return
 	}
-	marker2 := ')->_data)._${short_name}'
+	marker2 := ')->_data).${cvf}'
 	if idx := inner_str.index(marker2) {
 		simplified := inner_str[..idx + 1]
 		g.sb.write_string('(*(${simplified}))')
@@ -3926,7 +4061,7 @@ fn (mut g Gen) gen_as_cast_expr(node ast.AsCastExpr) {
 		g.sb.write_string('(*((${type_name}*)(${inner_str})))')
 		return
 	}
-	if inner_str.contains('->_data._${short_name}') || inner_str.contains('._data._${short_name}') {
+	if inner_str.contains('->_data.${cvf}') || inner_str.contains('._data.${cvf}') {
 		g.sb.write_string('(*((${type_name}*)(${inner_str})))')
 		return
 	}
@@ -3935,9 +4070,9 @@ fn (mut g Gen) gen_as_cast_expr(node ast.AsCastExpr) {
 	// Non-scalar sum type variants are stored as heap pointers that can be NULL
 	// when the sum type is zero-initialized. Add null guard with zero fallback.
 	if !g.is_scalar_sum_payload_type(type_name) && type_name != 'string' {
-		g.sb.write_string('(((${inner_str})${sep}_data._${short_name}) ? (*((${type_name}*)(((${inner_str})${sep}_data._${short_name})))) : (${type_name}){0})')
+		g.sb.write_string('(((${inner_str})${sep}_data.${cvf}) ? (*((${type_name}*)(((${inner_str})${sep}_data.${cvf})))) : (${type_name}){0})')
 	} else {
-		g.sb.write_string('(*((${type_name}*)(((${inner_str})${sep}_data._${short_name}))))')
+		g.sb.write_string('(*((${type_name}*)(((${inner_str})${sep}_data.${cvf}))))')
 	}
 }
 
