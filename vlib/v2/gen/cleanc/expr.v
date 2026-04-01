@@ -1617,7 +1617,11 @@ fn (mut g Gen) expr(node ast.Expr) {
 				// @STRUCT returns the name of the enclosing struct for methods
 				struct_name := if g.cur_fn_name.contains('__') {
 					parts := g.cur_fn_name.split('__')
-					if parts.len >= 2 { parts[parts.len - 2] } else { '' }
+					if parts.len >= 2 {
+						parts[parts.len - 2]
+					} else {
+						''
+					}
 				} else {
 					''
 				}
@@ -2038,8 +2042,7 @@ fn (mut g Gen) expr(node ast.Expr) {
 			// we need to emit the correct comparison for the actual type.
 			if g.active_generic_types.len > 0 && node.lhs is ast.Ident
 				&& node.lhs.name in ['string__eq', 'string__ne', 'string__lt', 'string__compare']
-				&& node.args.len == 2
-				&& (!g.generic_operand_is_string(node.args[0])
+				&& node.args.len == 2 && (!g.generic_operand_is_string(node.args[0])
 				|| !g.generic_operand_is_string(node.args[1])) {
 				cmp_type := g.get_expr_type(node.args[0])
 				if cmp_type != '' && cmp_type != 'string' {
@@ -2047,7 +2050,8 @@ fn (mut g Gen) expr(node ast.Expr) {
 					is_ne := node.lhs.name == 'string__ne'
 					is_lt := node.lhs.name == 'string__lt'
 					// Primitive types: use == / != / < directly
-					if cmp_type in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'byte', 'rune', 'bool', 'usize', 'isize'] {
+					if cmp_type in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64',
+						'f32', 'f64', 'byte', 'rune', 'bool', 'usize', 'isize'] {
 						g.sb.write_string('(')
 						g.expr(node.args[0])
 						if is_eq {

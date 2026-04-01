@@ -371,8 +371,7 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 				init_type := g.expr_type_to_c(rhs.typ)
 				is_generic_rhs := rhs.typ is ast.Ident
 					&& is_generic_placeholder_type_name(rhs.typ.name)
-				if init_type != '' && init_type != 'void'
-					&& (init_type != 'int' || is_generic_rhs) {
+				if init_type != '' && init_type != 'void' && (init_type != 'int' || is_generic_rhs) {
 					typ = init_type
 					generic_type_resolved = true
 				}
@@ -578,8 +577,7 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 						// But NOT if the type was already correctly resolved from the
 						// RHS expression type annotation (InitExpr/CallExpr).
 						generic_type_mismatch := g.active_generic_types.len > 0
-							&& !generic_type_resolved
-							&& scoped_type != typ && scoped_type != 'f64'
+							&& !generic_type_resolved && scoped_type != typ && scoped_type != 'f64'
 						if (typ == '' || typ == 'int' || typ == 'int_literal' || typ == 'void*'
 							|| typ == 'voidptr' || generic_container_fallback
 							|| generic_type_mismatch) && scoped_type != ''

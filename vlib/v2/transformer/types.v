@@ -1405,9 +1405,8 @@ fn (t &Transformer) type_expr_name_full(expr ast.Expr) string {
 fn (t &Transformer) type_expr_name_qualified(expr ast.Expr) string {
 	if expr is ast.Ident {
 		name := expr.name
-		if name in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64',
-			'byte', 'rune', 'f32', 'f64', 'usize', 'isize', 'bool', 'string',
-			'voidptr', 'charptr', 'byteptr'] {
+		if name in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'byte', 'rune',
+			'f32', 'f64', 'usize', 'isize', 'bool', 'string', 'voidptr', 'charptr', 'byteptr'] {
 			return name
 		}
 		if t.cur_module != '' && t.cur_module != 'main' && t.cur_module != 'builtin' {

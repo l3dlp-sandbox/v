@@ -2185,8 +2185,7 @@ fn (mut c Checker) stmt(stmt ast.Stmt) {
 fn (c &Checker) is_comptime_for_loop(stmt ast.Stmt) bool {
 	if stmt is ast.ForStmt && stmt.init is ast.ForInStmt {
 		if stmt.init.expr is ast.SelectorExpr {
-			return stmt.init.expr.rhs.name == 'methods'
-				|| stmt.init.expr.rhs.name == 'fields'
+			return stmt.init.expr.rhs.name == 'methods' || stmt.init.expr.rhs.name == 'fields'
 		}
 	}
 	return false

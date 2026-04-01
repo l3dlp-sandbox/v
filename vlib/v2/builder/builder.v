@@ -111,7 +111,8 @@ fn sanitize_staged_c_source(c_source string) string {
 	// Emit the struct, global instance, and accessor function so .m files can link.
 	if source.contains('ui__webview__DarwinWebViewState')
 		&& !source.contains('struct ui__webview__DarwinWebViewState {') {
-		source = source + '
+		source = source +
+			'
 struct ui__webview__DarwinWebViewState { string cookie_val; };
 static ui__webview__DarwinWebViewState _g_darwin_webview_state;
 ui__webview__DarwinWebViewState* ui__webview__darwin_webview_state(void) { return &_g_darwin_webview_state; }
